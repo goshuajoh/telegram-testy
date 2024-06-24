@@ -1,3 +1,4 @@
+#include "ESP_IDF_Telebot.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -16,36 +17,29 @@
 #include "driver/gpio.h"
 #include "cJSON.h"
 #include <time.h>
-#include "esp_sleep.h"
-
-#define BOOT_BUTTON_GPIO GPIO_NUM_0
-#define LED_GPIO GPIO_NUM_5
-
-#define MAX_HTTP_RECV_BUFFER 2048
-#define MAX_HTTP_OUTPUT_BUFFER 4096
-
-static const char *TAG = "HTTP_CLIENT Handler";
-static const char *TAG1 = "wifi station";
-
-#define WIFI_SSID "ESP_1"
-#define WIFI_PASS "Espressif!123"
-#define MAXIMUM_RETRY 10
-
-#define TELEGRAM_BOT_TOKEN "7433396702:AAEjJx4f1eV7V0GRe7pRDLvQ0v0sk-C8XOQ"
-char url_string[512] = "https://api.telegram.org/bot";
-#define TELEGRAM_HOST "api.telegram.org"
-#define TELEGRAM_SSL_PORT 443
-#define chat_ID2 "219745533"
-
-static EventGroupHandle_t s_wifi_event_group;
 
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT BIT1
+#define MAX_HTTP_OUTPUT_BUFFER 4096
+#define TELEGRAM_BOT_TOKEN "7433396702:AAEjJx4f1eV7V0GRe7pRDLvQ0v0sk-C8XOQ"
 
+static const char *TAG = "ESP_TELE";
+static EventGroupHandle_t s_wifi_event_group;
 static int s_retry_num = 0;
-int count = 0;
+static char telegram_bot_token[128] = {0};
+static long offset = 0;
+static int longPoll = 15;
+static int HANDLE_MESSAGES = 10;
 
 extern const char telegram_certificate_pem_start[] asm("_binary_telegram_certificate_pem_start");
+
+typedef struct {
+    char command[32];
+    void (*handler)(void);
+} command_handler_t;
+
+static command_handler_t command_handlers[10];
+static int command_handler_count = 0;
 
 static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
@@ -55,44 +49,37 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
     }
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
     {
-        if (s_retry_num < MAXIMUM_RETRY)
+        if (s_retry_num < 10)
         {
             esp_wifi_connect();
             s_retry_num++;
-            ESP_LOGI(TAG1, "retry to connect to the AP");
+            ESP_LOGI(TAG, "retry to connect to the AP");
         }
         else
         {
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
         }
-        ESP_LOGI(TAG1, "connect to the AP fail");
+        ESP_LOGI(TAG, "connect to the AP fail");
     }
     else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
     {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
-        ESP_LOGI(TAG1, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
+        ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
         s_retry_num = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
 
-void configure_gpio()
+void esp_tele_init(const char *ssid, const char *password)
 {
-    gpio_config_t io_conf;
-    io_conf.intr_type = GPIO_INTR_NEGEDGE;
-    io_conf.pin_bit_mask = (1ULL << BOOT_BUTTON_GPIO);
-    io_conf.mode = GPIO_MODE_INPUT;
-    io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
-    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    gpio_config(&io_conf);
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
 
-    esp_rom_gpio_pad_select_gpio(LED_GPIO);
-    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
-    gpio_set_level(LED_GPIO, 0);
-}
-
-void wifi_init_sta(void)
-{
     s_wifi_event_group = xEventGroupCreate();
 
     ESP_ERROR_CHECK(esp_netif_init());
@@ -110,8 +97,8 @@ void wifi_init_sta(void)
 
     wifi_config_t wifi_config = {
         .sta = {
-            .ssid = WIFI_SSID,
-            .password = WIFI_PASS,
+            .ssid = ssid,
+            .password = password,
             .threshold.authmode = WIFI_AUTH_WPA2_PSK,
             .pmf_cfg = {.capable = true, .required = false},
         },
@@ -120,21 +107,21 @@ void wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG1, "wifi_init_sta finished.");
+    ESP_LOGI(TAG, "wifi_init_sta finished.");
 
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
 
     if (bits & WIFI_CONNECTED_BIT)
     {
-        ESP_LOGI(TAG1, "connected to ap SSID:%s password:%s", WIFI_SSID, WIFI_PASS);
+        ESP_LOGI(TAG, "connected to ap SSID:%s", ssid);
     }
     else if (bits & WIFI_FAIL_BIT)
     {
-        ESP_LOGI(TAG1, "Failed to connect to SSID:%s, password:%s", WIFI_SSID, WIFI_PASS);
+        ESP_LOGI(TAG, "Failed to connect to SSID:%s", ssid);
     }
     else
     {
-        ESP_LOGE(TAG1, "UNEXPECTED EVENT");
+        ESP_LOGE(TAG, "UNEXPECTED EVENT");
     }
 
     ESP_ERROR_CHECK(esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, instance_got_ip));
@@ -217,10 +204,6 @@ esp_err_t _http_event_handler(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
-static long offset = 0;
-static int longPoll = 15;
-static int HANDLE_MESSAGES = 10;
-
 char *url_encode(const char *str)
 {
     char *enc_str = malloc(strlen(str) * 3 + 1);
@@ -292,37 +275,27 @@ void handleNewMessages(int numNewMessages, cJSON *json)
 
         const char *text_str = cJSON_GetStringValue(text);
         const char *from_name_str = cJSON_GetStringValue(from_name);
-        if (strcmp(text_str, "/ledon") == 0)
+
+        for (int j = 0; j < command_handler_count; j++)
         {
-            gpio_set_level(LED_GPIO, 1);
-            bot_send_message(chat_ID2, "Led is ON");
-        }
-        else if (strcmp(text_str, "/ledoff") == 0)
-        {
-            gpio_set_level(LED_GPIO, 0);
-            bot_send_message(chat_ID2, "Led is OFF");
-        }
-        else if (strcmp(text_str, "/status") == 0)
-        {
-            if (gpio_get_level(LED_GPIO))
+            if (strcmp(text_str, command_handlers[j].command) == 0)
             {
-                bot_send_message(chat_ID2, "Led is ON");
-            }
-            else
-            {
-                bot_send_message(chat_ID2, "Led is OFF");
+                command_handlers[j].handler();
             }
         }
-        else if (text_str && strcmp(text_str, "/start") == 0)
+
+        if (text_str && strcmp(text_str, "/start") == 0)
         {
             char welcome[256];
             snprintf(welcome, sizeof(welcome),
-                     "Welcome to Universal Arduino Telegram Bot library, %s.\n"
-                     "This is Flash Led Bot example.\n\n"
-                     "/ledon : to switch the Led ON\n"
-                     "/ledoff : to switch the Led OFF\n"
-                     "/status : Returns current status of LED\n",
+                     "Welcome to the bot, %s.\n"
+                     "Available commands:\n",
                      from_name_str ? from_name_str : "Guest");
+            for (int j = 0; j < command_handler_count; j++)
+            {
+                strcat(welcome, command_handlers[j].command);
+                strcat(welcome, "\n");
+            }
             bot_send_message("219745533", welcome);
         }
     }
@@ -356,7 +329,6 @@ void get_updates_task(void *pvParameters)
 
             if (status_code == 200 && content_length > 0)
             {
-                count = 0;
                 ESP_LOGI(TAG, "Response: %s", buffer);
 
                 cJSON *json = cJSON_Parse(buffer);
@@ -376,20 +348,6 @@ void get_updates_task(void *pvParameters)
         else
         {
             ESP_LOGD(TAG, "HTTP GET request failed: %s", esp_err_to_name(err));
-            count += 1;
-            if (count >= 3)
-            {
-                ESP_LOGI(TAG, "Entering light sleep after %d consecutive failures", count);
-                esp_sleep_enable_timer_wakeup(5* 1000 * 1000);
-                esp_light_sleep_start();
-
-                esp_wifi_connect();
-                count = 0;
-            }
-            else
-            {
-                vTaskDelay(5000 / portTICK_PERIOD_MS);
-            }
         }
 
         esp_http_client_cleanup(client);
@@ -399,7 +357,24 @@ void get_updates_task(void *pvParameters)
     }
 }
 
-void app_main(void)
+void add_command(const char *command, void (*handler)(void))
+{
+    if (command_handler_count < 10)
+    {
+        strncpy(command_handlers[command_handler_count].command, command, sizeof(command_handlers[command_handler_count].command) - 1);
+        command_handlers[command_handler_count].handler = handler;
+        command_handler_count++;
+    }
+    else
+    {
+        ESP_LOGE(TAG, "Max number of commands reached");
+    }
+}
+
+void start_get_updates_task(void)
+{
+    xTaskCreate(&get_updates_task, "get_updates_task", 2 * 8192, NULL, 5, NULL);
+}
 {
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
@@ -411,5 +386,5 @@ void app_main(void)
 
     configure_gpio();
     wifi_init_sta();
-    xTaskCreate(&get_updates_task, "get_updates_task", 2 * 8192, NULL, 5, NULL);
+    xTaskCreate(&get_updates_task, "get_updates_task", 8192, NULL, 5, NULL);
 }
